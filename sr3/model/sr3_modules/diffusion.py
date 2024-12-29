@@ -6,7 +6,7 @@ from inspect import isfunction
 from functools import partial
 import numpy as np
 from tqdm import tqdm
-import torchvision
+
 
 def _warmup_beta(linear_start, linear_end, n_timestep, warmup_frac):
     betas = linear_end * np.ones(n_timestep, dtype=np.float64)
@@ -59,6 +59,7 @@ def default(val, d):
     if exists(val):
         return val
     return d() if isfunction(d) else d
+
 
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -163,21 +164,21 @@ class GaussianDiffusion(nn.Module):
 
         model_mean, posterior_log_variance = self.q_posterior(
             x_start=x_recon, x_t=x, t=t)
-        return model_mean, posterior_log_variance, x_recon
+        return model_mean, posterior_log_variance
 
     @torch.no_grad()
     def p_sample(self, x, t, clip_denoised=True, condition_x=None):
-        model_mean, model_log_variance, x_recon = self.p_mean_variance(
+        model_mean, model_log_variance = self.p_mean_variance(
             x=x, t=t, clip_denoised=clip_denoised, condition_x=condition_x)
         noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
-        return model_mean + noise * (0.5 * model_log_variance).exp(), x_recon
+        return model_mean + noise * (0.5 * model_log_variance).exp()
 
     @torch.no_grad()
-    def p_sample_loop(self, x_in, continous=False, step=None):
+    def p_sample_loop(self, x_in, continous=False):
         device = self.betas.device
-        sample_inter = self.num_timesteps//500#(1 | (self.num_timesteps//10))
+        sample_inter = (1 | (self.num_timesteps//10))
         if not self.conditional:
-            shape = x
+            shape = x_in
             img = torch.randn(shape, device=device)
             ret_img = img
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
@@ -187,17 +188,16 @@ class GaussianDiffusion(nn.Module):
         else:
             x = x_in
             shape = x.shape
-            img_t = torch.randn(shape, device=device)
-            ret_img = x.unsqueeze(0)
+            img = torch.randn(shape, device=device)
+            ret_img = x
             for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                img_t, img_0 = self.p_sample(img_t, i, condition_x=x)
+                img = self.p_sample(img, i, condition_x=x)
                 if i % sample_inter == 0:
-                    if continous:
-                        ret_img = torch.cat([ret_img, img_0.unsqueeze(0)], dim=0)
-                    else:
-                        ret_img = img_0
-        return ret_img
-
+                    ret_img = torch.cat([ret_img, img], dim=0)
+        if continous:
+            return ret_img
+        else:
+            return ret_img[-1]
 
     @torch.no_grad()
     def sample(self, batch_size=1, continous=False):
@@ -206,8 +206,8 @@ class GaussianDiffusion(nn.Module):
         return self.p_sample_loop((batch_size, channels, image_size, image_size), continous)
 
     @torch.no_grad()
-    def super_resolution(self, x_in, continous=False, step=None):
-        return self.p_sample_loop(x_in, continous, step=step)
+    def super_resolution(self, x_in, continous=False):
+        return self.p_sample_loop(x_in, continous)
 
     def q_sample(self, x_start, continuous_sqrt_alpha_cumprod, noise=None):
         noise = default(noise, lambda: torch.randn_like(x_start))
@@ -218,37 +218,7 @@ class GaussianDiffusion(nn.Module):
             (1 - continuous_sqrt_alpha_cumprod**2).sqrt() * noise
         )
 
-    @torch.no_grad()
-    def train_super_resolution(self, x_in, continous=False, step=None):
-        x_start = x_in['HR']
-        [b, c, h, w] = x_start.shape
-        x_start_ret = x_start.unsqueeze(0)
-        noise = torch.randn_like(x_start)
-        sample_inter = self.num_timesteps//500
-        for t in tqdm(reversed(range(0, self.num_timesteps)), desc='train sampling loop time step', total=self.num_timesteps):
-            if t % sample_inter != 0:
-                continue
-            continuous_sqrt_alpha_cumprod = torch.FloatTensor(
-                np.random.uniform(
-                    self.sqrt_alphas_cumprod_prev[t],
-                    self.sqrt_alphas_cumprod_prev[t+1],
-                    size=b
-                )
-            ).to(x_start.device)
-            continuous_sqrt_alpha_cumprod = continuous_sqrt_alpha_cumprod.view(
-                b, -1)
-            noise = torch.randn_like(x_start)
-            x_noisy = self.q_sample(
-                x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
-            self.denoise_fn.eval()
-            noise_pred = self.denoise_fn(
-                        torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
-            x_start_pred = (x_noisy - (1-continuous_sqrt_alpha_cumprod**2).sqrt().view(-1, 1, 1, 1) * noise_pred)/continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1)
-            x_start_pred = x_start_pred.clamp(-1., 1.)
-            x_start_ret = torch.cat([x_start_ret, x_start_pred.unsqueeze(0)], dim=0)
-        return x_start_ret
-    
-    def p_losses(self, x_in, noise=None, order='inf'):
+    def p_losses(self, x_in, noise=None):
         x_start = x_in['HR']
         [b, c, h, w] = x_start.shape
         t = np.random.randint(1, self.num_timesteps + 1)
@@ -265,38 +235,15 @@ class GaussianDiffusion(nn.Module):
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(
             x_start=x_start, continuous_sqrt_alpha_cumprod=continuous_sqrt_alpha_cumprod.view(-1, 1, 1, 1), noise=noise)
-        
-        if order == 'inf':
-            x_noisy_pred = x_noisy
-            noise_pred = noise
-            if not self.conditional:
-                noise_pred = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
-            else:
-                noise_pred = self.denoise_fn(
-                    torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
-        else:
-            order = float(order)
-            with torch.no_grad():
-                self.denoise_fn.eval()
-                if not self.conditional:
-                    noise_pred = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
-                else:
-                    noise_pred = self.denoise_fn(
-                        torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
-                self.denoise_fn.train()
-                error = noise - noise_pred
-                x_noisy_pred = x_noisy + ((1 - continuous_sqrt_alpha_cumprod**2)**((order+1)/2)).view(-1, 1, 1, 1) * error 
-                noise_pred = noise + ((1 - continuous_sqrt_alpha_cumprod**2)**((order)/2)).view(-1, 1, 1, 1) * error
 
         if not self.conditional:
-                noise_rec = self.denoise_fn(x_noisy_pred, continuous_sqrt_alpha_cumprod)
+            x_recon = self.denoise_fn(x_noisy, continuous_sqrt_alpha_cumprod)
         else:
-            noise_rec = self.denoise_fn(
-                torch.cat([x_in['SR'], x_noisy_pred], dim=1), continuous_sqrt_alpha_cumprod)
+            x_recon = self.denoise_fn(
+                torch.cat([x_in['SR'], x_noisy], dim=1), continuous_sqrt_alpha_cumprod)
 
-        loss_pix = self.loss_func(noise_rec, noise_pred)
-        return loss_pix
-
+        loss = self.loss_func(noise, x_recon)
+        return loss
 
     def forward(self, x, *args, **kwargs):
         return self.p_losses(x, *args, **kwargs)
